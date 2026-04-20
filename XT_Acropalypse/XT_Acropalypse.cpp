@@ -34,32 +34,27 @@ LONG __stdcall XT_Prepare(HANDLE hVolume, HANDLE hEvidence, DWORD nOpType, void*
 	return XT_PREPARE_CALLPILATE;
 }
 
-// Parse PNG chunks; we assume that the caller validates that this is an actual PNG file
+// Parse PNG chunks from an in-memory buffer; caller must validate magic and pass full file contents.
 // Based on code from https://gist.github.com/DavidBuchanan314/93de9d07f7fab494bcdf17c2bd6cef02
-INT64 ParsePNGChunks(HANDLE hPNGFile, INT64 nCurrentFileSize) {
+INT64 ParsePNGChunks(PBYTE pngBuffer, INT64 nCurrentFileSize) {
 	INT64 nOffset = 8;
+	const size_t PNGCHUNKHEADERSIZE = sizeof(PNGCHUNKHEADER);
 	PNGCHUNKHEADER chunk_header = {};
-	DWORD dwNumRead = 0;
 
-	// Compute this one time since we need to use it many times for comparison
-	// Rather than compute it each time - for performance reasons
-	size_t PNGCHUNKHEADERSIZE = sizeof(PNGCHUNKHEADER);
+	while (nOffset + (INT64)PNGCHUNKHEADERSIZE <= nCurrentFileSize) {
+		memcpy(&chunk_header, pngBuffer + nOffset, PNGCHUNKHEADERSIZE);
+		// Data is stored in big-endian on disk so we need to swap the byte order
+		chunk_header.size = _byteswap_ulong(chunk_header.size);
+		chunk_header.type = _byteswap_ulong(chunk_header.type);
+		nOffset += PNGCHUNKHEADERSIZE + chunk_header.size + PNG_CHECKSUM_LEN;
 
-	// Read the data
-	do {
-		dwNumRead = XWF_Read(hPNGFile, nOffset, (BYTE*)&chunk_header, (DWORD)PNGCHUNKHEADERSIZE);
-		if (dwNumRead == PNGCHUNKHEADERSIZE) {
-			// Data is stored in big-endian on disk so we need to swap the byte order
-			chunk_header.size = _byteswap_ulong((unsigned long)chunk_header.size);
-			chunk_header.type = _byteswap_ulong((unsigned long)chunk_header.type);
-			nOffset += PNGCHUNKHEADERSIZE + chunk_header.size + PNG_CHECKSUM_LEN;
+		if (chunk_header.type == PNG_CHUNK_IEND || nOffset >= nCurrentFileSize) {
+			break;
 		}
-	} while (dwNumRead == PNGCHUNKHEADERSIZE && chunk_header.type != PNG_CHUNK_IEND
-		&& nOffset < nCurrentFileSize);
+	}
 
 	if (nOffset > nCurrentFileSize) {
-		// Malformed PNG file; return nCurrentFileSize
-		// This will result in the file NOT being flagged as acropalypse
+		// Malformed PNG file; return nCurrentFileSize so caller does not flag it
 		return nCurrentFileSize;
 	}
 
@@ -154,26 +149,40 @@ LONG __stdcall XT_ProcessItemEx(LONG nItemID, HANDLE hItem, void* lpReserved) {
 
 	// PNG
 	if (LOBYTE(lTypeResult) == XT_ITEM_TYPE_CONFIRMED && _wcsnicmp(szType, L"png", 3) == 0) {
-		 // Read the PNG header and make sure it's valid
-		INT64 PNGHeader;
-		DWORD dwNumRead = XWF_Read(hItem, 0, (PBYTE)&PNGHeader, sizeof(PNGHeader));
-
-		// Get the filesize
 		INT64 nFileSize = XWF_GetItemSize(nItemID);
 
-		if (nFileSize <= 0) {
+		if (nFileSize <= (INT64)sizeof(UINT64) || nFileSize > MAXDWORD) {
 			XWF_OutputMessage(L"XT_Acropalypse error processing PNG file: Invalid File Size", 0);
 			return 0;
 		}
 
-		// Parse the PNG chunks
-		INT64 nOffset = ParsePNGChunks(hItem, nFileSize);
+		LPBYTE lpImageBuffer = (LPBYTE)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)nFileSize);
+		if (lpImageBuffer == NULL) {
+			XWF_OutputMessage(L"Error: Unable to allocate buffer for PNG image in XT_Acropalypse", 0);
+			return 0;
+		}
 
-		// At this point the nOffset should be the same as the file size;
-		// if not, it's possible that we've encountered the acropalypse bug
+		DWORD dwNumRead = XWF_Read(hItem, 0, lpImageBuffer, (DWORD)nFileSize);
+		if (dwNumRead != (DWORD)nFileSize) {
+			XWF_OutputMessage(L"Error: Incomplete file read when processing PNG image for XT_Acropalypse", 0);
+			HeapFree(GetProcessHeap(), 0, lpImageBuffer);
+			return 0;
+		}
+
+		// Validate PNG magic bytes before parsing
+		if (_byteswap_uint64(*(UINT64*)lpImageBuffer) != PNGMAGIC) {
+			HeapFree(GetProcessHeap(), 0, lpImageBuffer);
+			return 0;
+		}
+
+		// Parse the PNG chunks; nOffset should equal nFileSize for a clean file
+		INT64 nOffset = ParsePNGChunks(lpImageBuffer, nFileSize);
+
 		if (nOffset < nFileSize) {
 			FlagImage(nItemID);
 		}
+
+		HeapFree(GetProcessHeap(), 0, lpImageBuffer);
 
 		// Update the counters
 		EnterCriticalSection(&counterCriticalSection);
@@ -189,25 +198,24 @@ LONG __stdcall XT_ProcessItemEx(LONG nItemID, HANDLE hItem, void* lpReserved) {
 		_wcsnicmp(szType, L"jpeg", 4) == 0)) {
 		INT64 nItemSize = XWF_GetProp(hItem, XT_PROPERTY_LOGICAL_FILE_SIZE, NULL);
 
-		// Check to make sure we don't encounter a situation where we would have an INT overflow
-		if (nItemSize < 3) {
+		if (nItemSize < 3 || nItemSize > MAXDWORD) {
 			XWF_OutputMessage(L"XT_Acropalypse error processing JPG file: invalid file size", 0);
 			return 0;
 		}
 
-		LPBYTE lpImageBuffer = (LPBYTE)VirtualAlloc(NULL, (SIZE_T)nItemSize, MEM_COMMIT, PAGE_READWRITE);
+		LPBYTE lpImageBuffer = (LPBYTE)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)nItemSize);
 
 		if (lpImageBuffer != NULL) {
 			DWORD dwNumRead = XWF_Read(hItem, 0, lpImageBuffer, (DWORD)nItemSize);
 
 			// Make sure we read all the bytes of the JPG file
-			if (dwNumRead != nItemSize) {
+			if (dwNumRead != (DWORD)nItemSize) {
 				XWF_OutputMessage(L"Error: Incomplete file read when processing JPEG image for XT_Acropalypse", 0);
-				VirtualFree(lpImageBuffer, 0, MEM_RELEASE);
+				HeapFree(GetProcessHeap(), 0, lpImageBuffer);
 				return 0;
 			}
 
-			INT64 nOffset = ParseJPGSegments((PBYTE)lpImageBuffer, nItemSize);
+			INT64 nOffset = ParseJPGSegments(lpImageBuffer, nItemSize);
 			for (INT64 i = nOffset; i < nItemSize - 3; i++) {	// File size - 3 bytes ensures we never encounter the actual footer
 				if (lpImageBuffer[i] == 0xff && lpImageBuffer[i + 1] == 0xd9) {
 					FlagImage(nItemID);
@@ -215,8 +223,7 @@ LONG __stdcall XT_ProcessItemEx(LONG nItemID, HANDLE hItem, void* lpReserved) {
 				}
 			}
 
-			// Free the buffer
-			VirtualFree(lpImageBuffer, 0, MEM_RELEASE);
+			HeapFree(GetProcessHeap(), 0, lpImageBuffer);
 		}
 		else {
 			XWF_OutputMessage(L"Error: Unable to allocate buffer for JPEG image in XT_Acropalypse", 0);
