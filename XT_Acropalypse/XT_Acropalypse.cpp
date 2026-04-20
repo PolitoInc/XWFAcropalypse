@@ -38,7 +38,7 @@ LONG __stdcall XT_Prepare(HANDLE hVolume, HANDLE hEvidence, DWORD nOpType, void*
 // Based on code from https://gist.github.com/DavidBuchanan314/93de9d07f7fab494bcdf17c2bd6cef02
 INT64 ParsePNGChunks(HANDLE hPNGFile, INT64 nCurrentFileSize) {
 	INT64 nOffset = 8;
-	PPNGCHUNKHEADER chunk_header = new PNGCHUNKHEADER;
+	PNGCHUNKHEADER chunk_header = {};
 	DWORD dwNumRead = 0;
 
 	// Compute this one time since we need to use it many times for comparison
@@ -47,14 +47,14 @@ INT64 ParsePNGChunks(HANDLE hPNGFile, INT64 nCurrentFileSize) {
 
 	// Read the data
 	do {
-		dwNumRead = XWF_Read(hPNGFile, nOffset, (BYTE*)chunk_header, (DWORD)PNGCHUNKHEADERSIZE);
+		dwNumRead = XWF_Read(hPNGFile, nOffset, (BYTE*)&chunk_header, (DWORD)PNGCHUNKHEADERSIZE);
 		if (dwNumRead == PNGCHUNKHEADERSIZE) {
 			// Data is stored in big-endian on disk so we need to swap the byte order
-			chunk_header->size = _byteswap_ulong((unsigned long)chunk_header->size);
-			chunk_header->type = _byteswap_ulong((unsigned long)chunk_header->type);
+			chunk_header.size = _byteswap_ulong((unsigned long)chunk_header.size);
+			chunk_header.type = _byteswap_ulong((unsigned long)chunk_header.type);
+			nOffset += PNGCHUNKHEADERSIZE + chunk_header.size + PNG_CHECKSUM_LEN;
 		}
-		nOffset += PNGCHUNKHEADERSIZE + chunk_header->size + PNG_CHECKSUM_LEN;
-	} while (dwNumRead == PNGCHUNKHEADERSIZE && chunk_header->type != PNG_CHUNK_IEND
+	} while (dwNumRead == PNGCHUNKHEADERSIZE && chunk_header.type != PNG_CHUNK_IEND
 		&& nOffset < nCurrentFileSize);
 
 	if (nOffset > nCurrentFileSize) {
@@ -75,13 +75,13 @@ INT64 ParseJPGSegments(PBYTE JPG_File, INT64 nCurrentFileSize) {
 
 	// Read the data
 	do {
-		// Cast the memory buffer at the specified offset as a JPG_SEGMENT_HEADER object
-		PJPG_SEGMENT_HEADER segment = (PJPG_SEGMENT_HEADER)(JPG_File + nOffset);
-
-		// Check null pointer
-		if (segment == NULL) {
+		// Ensure there are enough bytes left to read a full segment header before dereferencing
+		if (nOffset + (INT64)sizeof(JPG_SEGMENT_HEADER) > nCurrentFileSize) {
 			break;
 		}
+
+		// Cast the memory buffer at the specified offset as a JPG_SEGMENT_HEADER object
+		PJPG_SEGMENT_HEADER segment = (PJPG_SEGMENT_HEADER)(JPG_File + nOffset);
 
 		// Confirm validity of the segment
 		if (segment->segment_hibyte != 0xff) {
@@ -128,10 +128,7 @@ BOOL FlagImage(LONG nItemID) {
 	if (lpMetadata == NULL || wcsstr(lpMetadata, L"Acropalypse") == NULL) {
 		XWF_AddExtractedMetadata(nItemID, (LPWSTR)L"Possible Acropalypse image", 2);
 	}
-	else {
-		XWF_OutputMessage(L"Error adding metadata to item!", 0);
-		return FALSE;
-	}
+	// else: metadata already contains "Acropalypse" — already flagged, nothing to do
 
 	// Upate the acropalypse image counter
 	EnterCriticalSection(&counterCriticalSection);
